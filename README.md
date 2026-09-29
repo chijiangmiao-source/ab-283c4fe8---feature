@@ -39,11 +39,36 @@ SHA-256（hashType=2，hashSize=32）CodeDirectory（magic `0xFADE0C02`），并
 
 | 方法 | 路径 | 说明 |
 | --- | --- | ---
-| GET | `/` | 粘贴页面（Base64 切片 + 审计标识） |
-| POST | `/api/audits` | 提交 `{auditId, payloadBase64}` |
+| GET | `/` | 粘贴页面（整包提交或分段送检） |
+| POST | `/api/audits` | 一次性整包提交 `{auditId, payloadBase64}` |
 | GET | `/api/audits` | 已有审计标识列表 |
 | GET | `/api/audits/<id>` | 读取冻结审计（结论、CD 摘要、页长、覆盖范围、逐页证据） |
+| PUT | `/api/submissions/<id>` | 建立/幂等重开分段送检 `{totalBytes, expectedSha256}` |
+| GET | `/api/submissions/<id>` | 读取送检状态（`status`、已收/连续字节、首个缺口、区间、拒绝原因/冲突范围） |
+| PUT | `/api/submissions/<id>/segments` | 上传一个 Base64 区段 `{start, end, dataBase64}`（半开区间，单段 ≤ 64 KiB，可乱序） |
+| POST | `/api/submissions/<id>/seal` | 确认封存：拼装、整体 SHA-256、严格结构/逐页复核，同事务生成或复用冻结审计 |
 | GET | `/healthz` | 健康状态 |
+
+### 分段送检语义
+
+审查员在页面选择**分段送检**后，以同一审计标识、总字节数（≤ 2 MiB）与预期
+载荷 SHA-256 建立送检，随后可**乱序**提交不超过 64 KiB 的 Base64 区段
+（半开区间 `[start,end)`），并在断线后读取已收到的连续覆盖范围续传：
+
+* 每段的区间与原始字节都持久化在 SQLite；状态字段
+  `status`（`receiving`/`sealed`/`rejected`）、`receivedBytes`、
+  `contiguousBytes`、`firstGap`、`coveredRanges`；
+* **相同范围或相交部分只有逐字节相同才可重传**（自动合并为更大区间）；
+  任一重叠冲突立即把送检冻结为 `rejected`，返回首个冲突范围 `conflictRange`；
+* 建立后变更总长或摘要 -> 409 且送检保持不变；已存在同标识冻结审计时，
+  同摘要复用、异摘要拒绝，分段流程绝不影响既有完整审计；
+* 封存仅在 `[0,totalBytes)` 无空洞、总长 ≤ 2 MiB 且整体 SHA-256 一致后，
+  才把拼装字节交给严格 SuperBlob 解析与逐页复核；结构失败只留下该送检的
+  拒绝原因（422），不写也读不到成功审计；
+* 封存与最后一段并发、进程重启或重复封存都不会产生两份审计、漏页或改变
+  页证据——“生成或复用冻结审计 + 送检置 sealed”在同一事务完成；
+* 封存成功响应顶层即冻结审计字段（与整包接口同构），另可用
+  GET `/api/audits/<id>` 读取分页证据。
 
 冻结审计字段：`verdict`（verified/mismatch）、`codeDirectorySha256`（代码目录摘要）、
 `pageSize`、`codeLimit`、`codeSlots`、`coveredBytes`、`firstFailedSlot`、
@@ -63,8 +88,9 @@ AUDIT_HOST_PORT=9090 docker compose up --build
 ## 验证（compose verify）
 
 `verify` 服务结合**代码测试**（pytest）、**构建检查**（镜像构建时 py_compile），
-以及**提交后读取冻结审计与健康状态的 HTTP 冒烟**（`scripts/smoke_http.py`）
-确认分页证据与幂等行为；执行完毕后退出，并以退出码报告结果：
+以及**整包提交、读取冻结审计、健康状态，以及分段送检（乱序分段、重启续传、
+冲突重传、封存后分页证据）的 HTTP 冒烟**（`scripts/smoke_http.py`）
+确认幂等与封存行为；执行完毕后退出，并以退出码报告结果：
 
 ```bash
 docker compose up --build --abort-on-container-exit --exit-code-from verify
@@ -86,9 +112,11 @@ python scripts/smoke_http.py http://127.0.0.1:18080   # HTTP 冒烟，退出码�
 
 ```
 app/codesig.py    大端 SuperBlob / SHA-256 CodeDirectory 严格解析 + 逐页复算
-app/store.py      冻结审计存储（SQLite，幂等/复用拒绝/失败不落库）
+app/store.py      冻结审计与分段送检存储（SQLite；幂等/复用拒绝/失败不落库、
+                  乱序区段持久化、冲突冻结、封存与审计同一事务）
 app/server.py     HTTP API + 粘贴页面（仅 Python 标准库）
-tests/            55 项单元/HTTP 测试（含手工构造的真实结构夹具）
-scripts/smoke_http.py  compose verify 调用的 HTTP 冒烟
+tests/            单元/HTTP 测试（含手工构造的真实结构夹具与分段送检用例）
+scripts/smoke_http.py  compose verify 调用的 HTTP 冒烟（含乱序分段、重启续传、
+                       冲突重传、封存分页证据）
 docker-compose.yml     audit + verify 两个服务
 ```
