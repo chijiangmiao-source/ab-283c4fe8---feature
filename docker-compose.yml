@@ -1,0 +1,49 @@
+services:
+  audit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: codedirectory-page-audit:latest
+    environment:
+      AUDIT_HOST: 0.0.0.0
+      AUDIT_PORT: "8080"
+      AUDIT_DB: /data/audits.sqlite3
+    # 宿主机端口可配置：AUDIT_HOST_PORT=9090 docker compose up
+    ports:
+      - "${AUDIT_HOST_PORT:-8080}:8080"
+    volumes:
+      - audit-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status == 200 else 1)"
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      start_period: 2s
+    restart: unless-stopped
+
+  # 验证服务：构建检查（镜像构建时 py_compile）+ 代码测试（pytest）
+  # + 提交后读取冻结审计与健康状态的 HTTP 冒烟；执行完毕即退出，
+  # 退出码即整体结论。推荐运行：
+  #   docker compose up --build --abort-on-container-exit --exit-code-from verify
+  verify:
+    image: codedirectory-page-audit:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      audit:
+        condition: service_healthy
+    environment:
+      PYTHONPATH: /app
+    command:
+      - /bin/sh
+      - -c
+      - "python -m pytest -q && python scripts/smoke_http.py http://audit:8080"
+    restart: "no"
+
+volumes:
+  audit-data:
