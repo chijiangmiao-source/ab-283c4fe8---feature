@@ -35,15 +35,43 @@ SHA-256（hashType=2，hashSize=32）CodeDirectory（magic `0xFADE0C02`），并
 * **结构解析失败** → **422**，**不写库**，不占用标识，绝不留下“成功结论”；
 * `verified` 与 `mismatch` 都是完整、冻结、可重复读取的结论。
 
+## 分段送检（乱序 / 断线续传）
+
+大切片可分段提交：审查员以**同一审计标识、总字节数、预期载荷 SHA-256** 开始送检，
+随后把载荷切成**不超过 64 KiB** 的 Base64 区段，按**半开区间 `[start,end)` 乱序**
+上传。每段的区间与原始字节在收到后立即写入 SQLite，断线或进程重启后用
+`GET …/segments` 读取**自 0 起的连续覆盖范围与首个缺口**，重新 `begin`（幂等）后续传。
+
+* 区间重叠时，重叠部分必须**逐字节相同**：完全相同的重传幂等去重；
+* 任一重叠字节不一致 → 送检**永久冻结为 `rejected`**，响应与进度接口给出
+  **首个冲突范围**；冲突段本身不落库；
+* `begin` 时变更总字节数或预期摘要 → 同样冻结为 `rejected`；
+* 冲突拒绝**不影响**任何已存在的完整冻结审计，也绝不产生可读取的成功审计；
+* **确认封存**（`POST …/seal`）只在 `[0,totalBytes)` 无空洞、总长 ≤ 2 MiB、
+  拼装字节整体 SHA-256 与预期摘要一致后，才进入严格 SuperBlob 解析与逐页复核；
+  通过后在**同一立即事务**中生成（或复用）冻结审计并把送检置为 `sealed`；
+* 结构解析失败只把该送检置为 `rejected`（原因可在进度接口读取），不写审计；
+* 封存与最后一段并发、进程重启、重复封存都不会产生两份审计、漏页或改变页证据；
+* 既有一次性整包提交与读取接口的语义完全不变；对进行中的同标识送检，整包提交
+  仅在其字节恰为声明完整载荷时代为封存，否则 409。
+
+送检进度字段：`state`（`receiving`/`sealed`/`rejected`）、`totalBytes`、
+`expectedSha256`、`coveredRanges`（合并后的半开区间）、`receivedBytes`、
+`contiguousCoverage`（自 0 起连续覆盖字节数）、`firstGap`、`conflictRange`、`reason`。
+
 ## API
 
 | 方法 | 路径 | 说明 |
 | --- | --- | ---
-| GET | `/` | 粘贴页面（Base64 切片 + 审计标识） |
+| GET | `/` | 粘贴页面（整包提交 + 分段送检控件） |
 | POST | `/api/audits` | 提交 `{auditId, payloadBase64}` |
 | GET | `/api/audits` | 已有审计标识列表 |
 | GET | `/api/audits/<id>` | 读取冻结审计（结论、CD 摘要、页长、覆盖范围、逐页证据） |
-| GET | `/healthz` | 健康状态 |
+| POST | `/api/audits/<id>/segments/begin` | 开始/恢复送检 `{totalBytes, expectedSha256}`（首次 201，恢复 200） |
+| PUT | `/api/audits/<id>/segments/<start>/<end>` | 上传 `[start,end)` 区段 `{chunkBase64}`（原始字节 ≤ 64 KiB） |
+| GET | `/api/audits/<id>/segments` | 送检进度：状态、覆盖区间、首个缺口或冲突范围 |
+| POST | `/api/audits/<id>/seal` | 确认封存；无空洞且摘要一致后冻结审计（可空请求体） |
+| GET | `/healthz` | 健康状态（含 `maxChunkBytes`） |
 
 冻结审计字段：`verdict`（verified/mismatch）、`codeDirectorySha256`（代码目录摘要）、
 `pageSize`、`codeLimit`、`codeSlots`、`coveredBytes`、`firstFailedSlot`、
@@ -86,9 +114,12 @@ python scripts/smoke_http.py http://127.0.0.1:18080   # HTTP 冒烟，退出码�
 
 ```
 app/codesig.py    大端 SuperBlob / SHA-256 CodeDirectory 严格解析 + 逐页复算
-app/store.py      冻结审计存储（SQLite，幂等/复用拒绝/失败不落库）
-app/server.py     HTTP API + 粘贴页面（仅 Python 标准库）
-tests/            55 项单元/HTTP 测试（含手工构造的真实结构夹具）
-scripts/smoke_http.py  compose verify 调用的 HTTP 冒烟
+app/store.py      冻结审计 + 分段送检存储（SQLite，立即事务、乱序区段持久化、
+                  重叠冲突冻结、无空洞/摘要/结构三重门封存、重复封存复用）
+app/server.py     HTTP API + 粘贴页面（整包提交 + 分段送检，仅 Python 标准库）
+tests/            80 项单元/HTTP 测试（含手工构造的真实结构夹具、并发封存、
+                  重启续传）
+scripts/smoke_http.py  compose verify 调用的 HTTP 冒烟（含乱序分段、进程重启
+                       续传、冲突重传、封存分页证据）
 docker-compose.yml     audit + verify 两个服务
 ```
